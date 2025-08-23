@@ -14,23 +14,34 @@ import google.generativeai as genai
 import json
 import re
 from dotenv import load_dotenv
+from sqlalchemy import text
+import threading
+import time
+import random
+import requests
 
-# Load environment variables from .env file
-load_dotenv()
-
-app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})  # More explicit CORS configuration
+# Load environment variables from .env file with force reload
+load_dotenv(override=True)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Add debug logging for Slack configuration
+print("==== SLACK CONFIGURATION DEBUG ====")
+print(f"SLACK_BOT_TOKEN: {os.getenv('SLACK_BOT_TOKEN')[:10]}... (Length: {len(os.getenv('SLACK_BOT_TOKEN', ''))})")
+print(f"SLACK_CHANNEL_ID: {os.getenv('SLACK_CHANNEL_ID')}")
+print("====================================")
+
+app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})  # More explicit CORS configuration
 
 # Configuration
 CONFIG = {
     'JIRA_SERVER': os.getenv('JIRA_SERVER', ""),
     'JIRA_USERNAME': os.getenv('JIRA_USERNAME', ""),
     'JIRA_API_TOKEN': os.getenv('JIRA_API_TOKEN', ""),
-    'JIRA_PROJECT_KEY': os.getenv('JIRA_PROJECT_KEY', "SMS"),
+    'JIRA_PROJECT_KEY': os.getenv('JIRA_PROJECT_KEY', "MP"),
     'SLACK_BOT_TOKEN': os.getenv('SLACK_BOT_TOKEN', ""),
     'SLACK_CHANNEL_ID': os.getenv('SLACK_CHANNEL_ID', ""),
     "GEMINI_API_KEY": os.getenv('GEMINI_API_KEY', "")
@@ -146,17 +157,36 @@ def create_jira_ticket(alert_message, severity):
 # Initialize Slack client
 def get_slack_client():
     try:
+        logger.info("Initializing Slack client with token starting with: %s...", CONFIG['SLACK_BOT_TOKEN'][:10] if CONFIG['SLACK_BOT_TOKEN'] else "None")
+        logger.info("Target Slack channel ID: %s", CONFIG['SLACK_CHANNEL_ID'])
+        
+        if not CONFIG['SLACK_BOT_TOKEN'] or not CONFIG['SLACK_CHANNEL_ID']:
+            logger.error("Missing Slack configuration: Bot token or channel ID is empty")
+            return None
+            
         client = WebClient(token=CONFIG['SLACK_BOT_TOKEN'])
+        
+        # Test API connection first
+        try:
+            auth_test = client.auth_test()
+            if auth_test["ok"]:
+                logger.info("Slack authentication successful! Connected as: %s", auth_test["user"])
+            else:
+                logger.error("Slack authentication failed: %s", auth_test.get("error", "Unknown error"))
+                return None
+        except SlackApiError as e:
+            logger.error("Slack API authentication error: %s", e.response['error'])
+            return None
         
         # Get channel info to verify we can access it
         try:
             response = client.conversations_info(channel=CONFIG['SLACK_CHANNEL_ID'])
             if not response["ok"]:
-                logger.error(f"Failed to get channel info: {response['error']}")
+                logger.error("Failed to get channel info: %s", response['error'])
                 return None
                 
             channel_info = response["channel"]
-            logger.info(f"Found channel: {channel_info['name']} (ID: {CONFIG['SLACK_CHANNEL_ID']})")
+            logger.info("Found channel: %s (ID: %s)", channel_info['name'], CONFIG['SLACK_CHANNEL_ID'])
             
             # Test posting a message to verify access
             try:
@@ -169,18 +199,18 @@ def get_slack_client():
                     logger.info("Successfully tested Slack message posting")
                     return client
                 else:
-                    logger.error(f"Failed to post test message: {response['error']}")
+                    logger.error("Failed to post test message: %s", response['error'])
                     return None
             except SlackApiError as e:
-                logger.error(f"Error testing Slack connection: {e.response['error']}")
+                logger.error("Error testing Slack connection: %s", e.response['error'])
                 return None
             
         except SlackApiError as e:
-            logger.error(f"Error getting channel info: {e.response['error']}")
+            logger.error("Error getting channel info: %s", e.response['error'])
             return None
             
     except Exception as e:
-        logger.error(f"Error initializing Slack client: {str(e)}")
+        logger.error("Error initializing Slack client: %s", str(e))
         return None
 
 # Initialize Jira client
@@ -470,6 +500,45 @@ class Alert(db.Model):
     def __repr__(self):
         return f"<Alert id={self.id}, severity={self.severity}>"
 
+# Define the priority mapping as a proper variable
+PRIORITY_MAPPING = {
+    "Critical": "Highest",
+    "High": "High",
+    "Medium": "Medium",
+    "Low": "Low"
+}
+
+# Define SIEM-specific models
+class SecurityEvent(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    message = db.Column(db.Text, nullable=False)
+    severity = db.Column(db.String(50), nullable=False)
+    timestamp = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    recommendations = db.Column(db.JSON, nullable=True)
+    jira_ticket_id = db.Column(db.String(50), nullable=True)
+    slack_notification_sent = db.Column(db.Boolean, default=False)
+    additional_data = db.Column(db.JSON, nullable=True)
+    
+    # Create indexes for faster searching
+    __table_args__ = (
+        db.Index('idx_severity', 'severity'),
+        db.Index('idx_timestamp', 'timestamp')
+    )
+
+    def __repr__(self):
+        return f'<SecurityEvent {self.id}>'
+
+# Function to create database tables
+def create_tables():
+    try:
+        # Create tables
+        db.create_all()
+        
+        logger.info("Database tables created successfully")
+    except Exception as e:
+        logger.error(f"Error creating database tables: {str(e)}")
+        raise
+
 # Add a fallback mechanism in case Gemini API fails
 
 # Create a fallback recommendations dictionary
@@ -622,17 +691,58 @@ def get_gemini_classification(alert_message):
         logger.error(f"Error generating classification with Gemini: {str(e)}")
         return {"severity": "Medium", "impact": "Unknown", "reasoning": f"Error: {str(e)}"}
 
-# Add endpoint to get available classification methods
-@app.route('/api/classification-methods', methods=['GET'])
-def get_classification_methods():
-    """Return available classification methods"""
-    methods = [
-        {"id": "model", "name": "Local ML Model", "description": "Uses the trained machine learning model"},
-        {"id": "gemini", "name": "Gemini AI", "description": "Uses Google's Gemini AI for intelligent classification"}
-    ]
-    return jsonify(methods)
+# Add SIEM-specific functions
 
-# 1️⃣ Process Incoming Alert
+def index_security_event(event_data):
+    """Index a security event in PostgreSQL"""
+    try:
+        # Add timestamp if not present
+        if 'timestamp' not in event_data:
+            event_data['timestamp'] = datetime.utcnow().isoformat()
+
+        # Index the event
+        event = SecurityEvent(
+            message=event_data.get('message', ''),
+            severity=event_data.get('severity', 'Medium'),
+            recommendations=event_data.get('recommendations', {}),
+            jira_ticket_id=event_data.get('jira_ticket_id'),
+            slack_notification_sent=event_data.get('slack_notification_sent', False),
+            additional_data=event_data.get('additional_data', {})
+        )
+        db.session.add(event)
+        db.session.commit()
+        return event.id
+    except Exception as e:
+        logger.error(f"Failed to index security event: {str(e)}")
+        return None
+
+def search_security_events(query, size=100):
+    """Search security events in PostgreSQL"""
+    try:
+        query_obj = SecurityEvent.query
+        
+        # Apply search conditions
+        if query:
+            query_obj = query_obj.filter(SecurityEvent.message.ilike(f'%{query}%'))
+        
+        # Order by timestamp and limit results
+        events = query_obj.order_by(SecurityEvent.timestamp.desc()).limit(size).all()
+        
+        return [{
+            'id': event.id,
+            'message': event.message,
+            'severity': event.severity,
+            'timestamp': event.timestamp.isoformat(),
+            'recommendations': event.recommendations,
+            'jira_ticket_id': event.jira_ticket_id,
+            'slack_notification_sent': event.slack_notification_sent,
+            'additional_data': event.additional_data
+        } for event in events]
+    except Exception as e:
+        logger.error(f"Failed to search security events: {str(e)}")
+        return []
+
+# Update process_alert function to include SIEM integration
 @app.route('/process_alert', methods=['POST'])
 def process_alert():
     # Start a database transaction
@@ -801,6 +911,19 @@ def process_alert():
         # If we got here, commit the transaction
         db_transaction.commit()
         db.session.commit()
+          # Index the alert in PostgreSQL
+        event_data = {
+            'message': alert_message,
+            'severity': severity,
+            'recommendations': recommendations,
+            'jira_ticket_id': ticket_key,
+            'slack_notification_sent': slack_success,
+            'additional_data': additional_data
+        }
+        
+        es_id = index_security_event(event_data)
+        if es_id:
+            logger.info(f"Alert indexed in PostgreSQL: {es_id}")
         
         # Return response
         response_data = {
@@ -835,15 +958,22 @@ def get_alerts():
         # First, check if additional_data column exists and add it if missing
         try:
             with db.engine.connect() as conn:
-                # Check if column exists
-                check_col = "SELECT column_name FROM information_schema.columns WHERE table_name='alert' AND column_name='additional_data'"
-                result = conn.execute(check_col)
+                # PostgreSQL-specific approach to check if column exists
+                check_col_query = """
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name='alert' AND column_name='additional_data'
+                """
+                # Use execution directly on the connection to avoid issues with non-executable SQL
+                result = conn.execute(check_col_query)
                 column_exists = result.fetchone() is not None
                 
                 if not column_exists:
                     # Add column if it doesn't exist
                     conn.execute("ALTER TABLE alert ADD COLUMN additional_data JSONB")
                     logger.info("Successfully added additional_data column")
+                else:
+                    logger.info("additional_data column already exists")
         except Exception as e:
             logger.error(f"Failed to check/add additional_data column: {str(e)}")
         
@@ -1086,12 +1216,548 @@ def migrate_database():
             "error": str(e)
         }), 500
 
-# Keep this part inside if __name__ == '__main__':
+# Add this diagnostic endpoint for Slack testing
+@app.route('/api/test-slack', methods=['GET'])
+def test_slack():
+    """Test Slack integration and return diagnostic info"""
+    try:
+        # Get configuration details
+        token_info = {
+            "provided": bool(CONFIG['SLACK_BOT_TOKEN']),
+            "length": len(CONFIG['SLACK_BOT_TOKEN']) if CONFIG['SLACK_BOT_TOKEN'] else 0,
+            "prefix": CONFIG['SLACK_BOT_TOKEN'][:10] + "..." if CONFIG['SLACK_BOT_TOKEN'] else "None"
+        }
+        
+        channel_info = {
+            "provided": bool(CONFIG['SLACK_CHANNEL_ID']),
+            "value": CONFIG['SLACK_CHANNEL_ID'] if CONFIG['SLACK_CHANNEL_ID'] else "None"
+        }
+        
+        # Try to initialize Slack client
+        client = None
+        auth_result = {}
+        channel_check = {}
+        message_test = {}
+        
+        try:
+            client = WebClient(token=CONFIG['SLACK_BOT_TOKEN'])
+            
+            # Test authentication
+            try:
+                auth_response = client.auth_test()
+                auth_result = {
+                    "success": auth_response.get("ok", False),
+                    "user": auth_response.get("user", "Unknown"),
+                    "team": auth_response.get("team", "Unknown"),
+                    "error": auth_response.get("error", None)
+                }
+            except SlackApiError as e:
+                auth_result = {
+                    "success": False,
+                    "error": e.response['error'],
+                    "details": str(e)
+                }
+            
+            # If authentication succeeded, check channel access
+            if auth_result.get("success"):
+                try:
+                    channel_response = client.conversations_info(channel=CONFIG['SLACK_CHANNEL_ID'])
+                    if channel_response.get("ok", False):
+                        channel_data = channel_response.get("channel", {})
+                        channel_check = {
+                            "success": True,
+                            "name": channel_data.get("name", "Unknown"),
+                            "is_channel": channel_data.get("is_channel", False),
+                            "is_private": channel_data.get("is_private", False),
+                            "member_count": channel_data.get("num_members", 0)
+                        }
+                        
+                        # If channel access succeeded, try posting a test message
+                        try:
+                            test_response = client.chat_postMessage(
+                                channel=CONFIG['SLACK_CHANNEL_ID'],
+                                text="🔧 This is a test message from the Security Alert Bot diagnostic tool.",
+                                username="Security Alert Bot",
+                                icon_emoji=":lock:"
+                            )
+                            message_test = {
+                                "success": test_response.get("ok", False),
+                                "ts": test_response.get("ts", None),
+                                "error": test_response.get("error", None)
+                            }
+                        except SlackApiError as e:
+                            message_test = {
+                                "success": False,
+                                "error": e.response['error'],
+                                "details": str(e)
+                            }
+                    else:
+                        channel_check = {
+                            "success": False,
+                            "error": channel_response.get("error", "Unknown error")
+                        }
+                except SlackApiError as e:
+                    channel_check = {
+                        "success": False,
+                        "error": e.response['error'],
+                        "details": str(e)
+                    }
+        except Exception as e:
+            return jsonify({
+                "success": False,
+                "token_info": token_info,
+                "channel_info": channel_info,
+                "error": str(e)
+            })
+            
+        # Return all diagnostic information
+        return jsonify({
+            "success": message_test.get("success", False),
+            "token_info": token_info,
+            "channel_info": channel_info,
+            "authentication": auth_result,
+            "channel_check": channel_check,
+            "message_test": message_test
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+# Add new API endpoint for SIEM search
+@app.route('/api/search_alerts', methods=['POST'])
+def search_alerts():
+    try:
+        query = request.json.get('query', '')
+        size = request.json.get('size', 100)
+        
+        results = search_security_events(query, size)
+        return jsonify({
+            'status': 'success',
+            'results': results,
+            'count': len(results)
+        })
+    except Exception as e:
+        logger.error(f"Error searching alerts: {str(e)}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+# Define a function to create a new security event in PostgreSQL
+def create_security_event(event_data):
+    """Create a new security event in PostgreSQL"""
+    try:
+        event = SecurityEvent(
+            message=event_data.get('message', ''),
+            severity=event_data.get('severity', 'Medium'),
+            recommendations=event_data.get('recommendations', {}),
+            jira_ticket_id=event_data.get('jira_ticket_id'),
+            slack_notification_sent=event_data.get('slack_notification_sent', False),
+            additional_data=event_data.get('additional_data', {})
+        )
+        db.session.add(event)
+        db.session.commit()
+        return event.id
+    except Exception as e:
+        logger.error(f"Failed to create security event: {str(e)}")
+        return None
+
+# Define a function to search security events using PostgreSQL
+def search_security_events(query, start_date=None, end_date=None, severity=None, limit=100):
+    """Search security events using PostgreSQL"""
+    try:
+        query_obj = SecurityEvent.query
+        
+        # Apply search conditions
+        if query:
+            query_obj = query_obj.filter(SecurityEvent.message.ilike(f'%{query}%'))
+        
+        if start_date:
+            query_obj = query_obj.filter(SecurityEvent.timestamp >= start_date)
+        
+        if end_date:
+            query_obj = query_obj.filter(SecurityEvent.timestamp <= end_date)
+        
+        if severity:
+            query_obj = query_obj.filter(SecurityEvent.severity == severity)
+        
+        # Order by timestamp and limit results
+        events = query_obj.order_by(SecurityEvent.timestamp.desc()).limit(limit).all()
+        
+        return [{
+            'id': event.id,
+            'message': event.message,
+            'severity': event.severity,
+            'timestamp': event.timestamp.isoformat(),
+            'recommendations': event.recommendations,
+            'jira_ticket_id': event.jira_ticket_id,
+            'slack_notification_sent': event.slack_notification_sent,
+            'additional_data': event.additional_data
+        } for event in events]
+    except Exception as e:
+        logger.error(f"Failed to search security events: {str(e)}")
+        return []
+
+# SIEM API Endpoints
+
+@app.route('/api/siem/status', methods=['GET'])
+def siem_status():
+    """Get SIEM system status"""
+    try:
+        # Check database connection
+        db.session.execute('SELECT 1')
+        status = {
+            'status': 'healthy',
+            'db_connection': 'ok',
+            'timestamp': datetime.utcnow().isoformat()
+        }
+        return jsonify(status)
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'error': str(e)
+        }), 500
+
+@app.route('/api/siem/alerts', methods=['GET'])
+def get_siem_alerts():
+    """Get SIEM alerts with filtering"""
+    try:
+        query = request.args.get('query', '')
+        severity = request.args.get('severity')
+        start_date = request.args.get('start_date')
+        end_date = request.args.get('end_date')
+        limit = int(request.args.get('limit', 100))
+        
+        query_obj = SecurityEvent.query
+        
+        if query:
+            query_obj = query_obj.filter(SecurityEvent.message.ilike(f'%{query}%'))
+        
+        if severity:
+            query_obj = query_obj.filter(SecurityEvent.severity == severity)
+        
+        if start_date:
+            query_obj = query_obj.filter(SecurityEvent.timestamp >= start_date)
+        
+        if end_date:
+            query_obj = query_obj.filter(SecurityEvent.timestamp <= end_date)
+        
+        events = query_obj.order_by(SecurityEvent.timestamp.desc()).limit(limit).all()
+        
+        return jsonify({
+            'status': 'success',
+            'alerts': [{
+                'id': event.id,
+                'message': event.message,
+                'severity': event.severity,
+                'timestamp': event.timestamp.isoformat(),
+                'recommendations': event.recommendations,
+                'jira_ticket_id': event.jira_ticket_id,
+                'slack_notification_sent': event.slack_notification_sent,
+                'additional_data': event.additional_data
+            } for event in events]
+        })
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'error': str(e)
+        }), 500
+
+@app.route('/api/siem/alerts/<int:alert_id>', methods=['GET'])
+def get_siem_alert(alert_id):
+    """Get a specific SIEM alert"""
+    try:
+        event = SecurityEvent.query.get_or_404(alert_id)
+        return jsonify({
+            'status': 'success',
+            'alert': {
+                'id': event.id,
+                'message': event.message,
+                'severity': event.severity,
+                'timestamp': event.timestamp.isoformat(),
+                'recommendations': event.recommendations,
+                'jira_ticket_id': event.jira_ticket_id,
+                'slack_notification_sent': event.slack_notification_sent,
+                'additional_data': event.additional_data
+            }
+        })
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'error': str(e)
+        }), 500
+
+@app.route('/api/siem/alerts/summary', methods=['GET'])
+def get_siem_summary():
+    """Get SIEM alerts summary"""
+    try:
+        # Get counts by severity
+        severity_counts = db.session.query(
+            SecurityEvent.severity,
+            db.func.count(SecurityEvent.id)
+        ).group_by(SecurityEvent.severity).all()
+        
+        # Get recent alerts
+        recent_alerts = SecurityEvent.query.order_by(
+            SecurityEvent.timestamp.desc()
+        ).limit(10).all()
+        
+        return jsonify({
+            'status': 'success',
+            'summary': {
+                'severity_counts': {
+                    severity: count for severity, count in severity_counts
+                },
+                'recent_alerts': [{
+                    'id': alert.id,
+                    'message': alert.message,
+                    'severity': alert.severity,
+                    'timestamp': alert.timestamp.isoformat()
+                } for alert in recent_alerts]
+            }
+        })
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'error': str(e)
+        }), 500
+
+# Admin page for viewing alerts
+
+# Global variables for threat intelligence simulation
+threat_intelligence_data = []
+simulation_running = False
+geographic_threats = []
+
+# Simulated threat intelligence feeds
+THREAT_FEEDS = [
+    "https://feeds.threatconnect.com/",
+    "https://intel.malwaredomainlist.com/",
+    "https://reputation.alienvault.com/",
+    "https://www.virustotal.com/intelligence/",
+    "https://cybercrime-tracker.net/"
+]
+
+ATTACK_TYPES = [
+    "DDoS Attack", "SQL Injection", "XSS Attack", "Brute Force", "Malware",
+    "Phishing", "Ransomware", "Data Exfiltration", "APT Campaign", "Zero-Day Exploit"
+]
+
+COUNTRIES = [
+    {"name": "United States", "lat": 39.8283, "lng": -98.5795},
+    {"name": "China", "lat": 35.8617, "lng": 104.1954},
+    {"name": "Russia", "lat": 61.5240, "lng": 105.3188},
+    {"name": "Germany", "lat": 51.1657, "lng": 10.4515},
+    {"name": "Brazil", "lat": -14.2350, "lng": -51.9253},
+    {"name": "India", "lat": 20.5937, "lng": 78.9629},
+    {"name": "United Kingdom", "lat": 55.3781, "lng": -3.4360},
+    {"name": "France", "lat": 46.2276, "lng": 2.2137},
+    {"name": "Japan", "lat": 36.2048, "lng": 138.2529},
+    {"name": "South Korea", "lat": 35.9078, "lng": 127.7669}
+]
+
+def generate_threat_intelligence():
+    """Generate simulated threat intelligence data"""
+    global threat_intelligence_data
+    
+    threat = {
+        "id": random.randint(1000, 9999),
+        "timestamp": datetime.now().isoformat(),
+        "threat_type": random.choice(ATTACK_TYPES),
+        "severity": random.choice(["Low", "Medium", "High", "Critical"]),
+        "source_ip": f"{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}",
+        "target_ip": f"192.168.{random.randint(1,255)}.{random.randint(1,255)}",
+        "country": random.choice(COUNTRIES)["name"],
+        "description": f"Detected {random.choice(ATTACK_TYPES).lower()} from suspicious IP address",
+        "confidence": random.randint(60, 95),
+        "indicators": {
+            "malicious_domains": [f"malicious{random.randint(1,100)}.com"],
+            "file_hashes": [f"sha256:{random.randint(100000000000000000000000000000000000000000000000000000000000000,999999999999999999999999999999999999999999999999999999999999999):064x}"],
+            "network_signatures": [f"TCP:{random.randint(1000,65535)}"]
+        }
+    }
+    
+    threat_intelligence_data.append(threat)
+    
+    # Keep only last 100 threats
+    if len(threat_intelligence_data) > 100:
+        threat_intelligence_data.pop(0)
+    
+    return threat
+
+def generate_geographic_threat():
+    """Generate geographic threat data"""
+    global geographic_threats
+    
+    country = random.choice(COUNTRIES)
+    threat = {
+        "id": random.randint(1000, 9999),
+        "timestamp": datetime.now().isoformat(),
+        "country": country["name"],
+        "lat": country["lat"] + random.uniform(-5, 5),
+        "lng": country["lng"] + random.uniform(-5, 5),
+        "threat_count": random.randint(1, 50),
+        "severity": random.choice(["Low", "Medium", "High", "Critical"]),
+        "attack_type": random.choice(ATTACK_TYPES)
+    }
+    
+    geographic_threats.append(threat)
+    
+    # Keep only last 50 geographic threats
+    if len(geographic_threats) > 50:
+        geographic_threats.pop(0)
+    
+    return threat
+
+def threat_simulation_worker():
+    """Background worker for threat simulation"""
+    global simulation_running
+    
+    while simulation_running:
+        try:
+            # Generate new threat every 2-5 seconds
+            time.sleep(random.uniform(2, 5))
+            generate_threat_intelligence()
+            generate_geographic_threat()
+        except Exception as e:
+            logger.error(f"Error in threat simulation: {str(e)}")
+
+@app.route('/api/threat-intelligence', methods=['GET'])
+def get_threat_intelligence():
+    """Get latest threat intelligence data"""
+    try:
+        return jsonify({
+            'status': 'success',
+            'data': threat_intelligence_data[-20:],  # Last 20 threats
+            'total_threats': len(threat_intelligence_data),
+            'simulation_status': 'running' if simulation_running else 'stopped'
+        })
+    except Exception as e:
+        logger.error(f"Error getting threat intelligence: {str(e)}")
+        return jsonify({
+            'status': 'error',
+            'error': str(e)
+        }), 500
+
+@app.route('/api/attack-simulation', methods=['POST'])
+def control_attack_simulation():
+    """Start or stop the attack simulation"""
+    global simulation_running
+    
+    try:
+        data = request.get_json()
+        action = data.get('action', 'start')
+        
+        if action == 'start' and not simulation_running:
+            simulation_running = True
+            # Start background thread
+            thread = threading.Thread(target=threat_simulation_worker, daemon=True)
+            thread.start()
+            
+            return jsonify({
+                'status': 'success',
+                'message': 'Attack simulation started',
+                'simulation_status': 'running'
+            })
+        
+        elif action == 'stop':
+            simulation_running = False
+            return jsonify({
+                'status': 'success',
+                'message': 'Attack simulation stopped',
+                'simulation_status': 'stopped'
+            })
+        
+        else:
+            return jsonify({
+                'status': 'info',
+                'message': 'Simulation already running',
+                'simulation_status': 'running'
+            })
+    
+    except Exception as e:
+        logger.error(f"Error controlling simulation: {str(e)}")
+        return jsonify({
+            'status': 'error',
+            'error': str(e)
+        }), 500
+
+@app.route('/api/geographic-threats', methods=['GET'])
+def get_geographic_threats():
+    """Get geographic threat data for mapping"""
+    try:
+        return jsonify({
+            'status': 'success',
+            'data': geographic_threats,
+            'total_locations': len(geographic_threats)
+        })
+    except Exception as e:
+        logger.error(f"Error getting geographic threats: {str(e)}")
+        return jsonify({
+            'status': 'error',
+            'error': str(e)
+        }), 500
+
+@app.route('/api/threat-stats', methods=['GET'])
+def get_threat_statistics():
+    """Get threat statistics and analytics"""
+    try:
+        if not threat_intelligence_data:
+            return jsonify({
+                'status': 'success',
+                'data': {
+                    'total_threats': 0,
+                    'severity_breakdown': {},
+                    'attack_type_breakdown': {},
+                    'top_countries': [],
+                    'recent_activity': []
+                }
+            })
+        
+        # Calculate statistics
+        severity_counts = {}
+        attack_type_counts = {}
+        country_counts = {}
+        
+        for threat in threat_intelligence_data:
+            # Severity breakdown
+            severity = threat['severity']
+            severity_counts[severity] = severity_counts.get(severity, 0) + 1
+            
+            # Attack type breakdown
+            attack_type = threat['threat_type']
+            attack_type_counts[attack_type] = attack_type_counts.get(attack_type, 0) + 1
+            
+            # Country breakdown
+            country = threat['country']
+            country_counts[country] = country_counts.get(country, 0) + 1
+        
+        # Get top 5 countries
+        top_countries = sorted(country_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+        
+        return jsonify({
+            'status': 'success',
+            'data': {
+                'total_threats': len(threat_intelligence_data),
+                'severity_breakdown': severity_counts,
+                'attack_type_breakdown': attack_type_counts,
+                'top_countries': [{'country': country, 'count': count} for country, count in top_countries],
+                'recent_activity': threat_intelligence_data[-10:]  # Last 10 threats
+            }
+        })
+    
+    except Exception as e:
+        logger.error(f"Error getting threat statistics: {str(e)}")
+        return jsonify({
+            'status': 'error',
+            'error': str(e)
+        }), 500
+
 if __name__ == '__main__':
     with app.app_context():
         try:
             # Create tables if they don't exist
-            db.create_all()
+            create_tables()
             logger.info("Database tables created successfully")
         except Exception as e:
             logger.error(f"Error creating database tables: {str(e)}")
